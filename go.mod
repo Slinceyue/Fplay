@@ -4,7 +4,6 @@ go 1.26.7
 
 require (
 	github.com/ebitengine/purego v0.11.0
-	github.com/godbus/dbus/v5 v5.2.2
 	github.com/mewkiz/flac v1.0.14
 	golang.org/x/term v0.45.0
 )
