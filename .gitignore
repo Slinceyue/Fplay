@@ -1,0 +1,6 @@
+/.idea/
+/flacplayer
+/flaccheck
+/tmpdev/
+*.test
+*.out
