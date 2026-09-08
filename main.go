@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"math/rand"
 	"os"
-	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"strconv"
@@ -83,29 +82,8 @@ func main() {
 	}
 }
 
-// acquireLock 单实例锁:同一用户只允许一个播放器进程,避免同屏叠画。
-func acquireLock() func() {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return nil
-	}
-	dir := filepath.Join(home, ".config", "flacplayer")
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return nil
-	}
-	f, err := os.OpenFile(filepath.Join(dir, "player.lock"), os.O_CREATE|os.O_RDWR, 0o644)
-	if err != nil {
-		return nil
-	}
-	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
-		_ = f.Close()
-		return nil
-	}
-	return func() {
-		_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
-		_ = f.Close()
-	}
-}
+// acquireLock 单实例锁:具体平台实现在 acquire_lock_*.go。
+func acquireLock() func() { return acquireLockPlatform() }
 
 func run() error {
 	home, _ := os.UserHomeDir()
@@ -278,28 +256,6 @@ func (a *app) cd(dir string) error {
 }
 
 // ---------- 播放控制 ----------
-
-func (a *app) audioEnsure() {
-	if a.audioStopped {
-		return
-	}
-	// ALSA 直写需独占设备,先停 PipeWire。
-	exec.Command("systemctl", "--user", "stop",
-		"pipewire.socket", "pipewire-pulse.socket",
-		"pipewire.service", "wireplumber.service", "pipewire-pulse.service").Run()
-	time.Sleep(300 * time.Millisecond)
-	a.audioStopped = true
-}
-
-func (a *app) restoreAudio() {
-	if !a.audioStopped {
-		return
-	}
-	exec.Command("systemctl", "--user", "start",
-		"pipewire.service", "wireplumber.service", "pipewire-pulse.service",
-		"pipewire.socket", "pipewire-pulse.socket").Run()
-	a.audioStopped = false
-}
 
 // markPosBase 记"当前引擎位置 = samplesNow,墙钟 = now"为进度条平滑的基准。
 // 进度条渲染时:pos = samplesNow + (now - posBaseAt) * rate。

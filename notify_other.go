@@ -8,3 +8,4 @@ type notifier struct{}
 func newNotifier(ch chan<- mkey) *notifier { return &notifier{} }
 
 func (n *notifier) update(path string, playing, paused bool) {}
+func (n *notifier) close()                                   {}

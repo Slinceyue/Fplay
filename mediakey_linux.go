@@ -1,3 +1,5 @@
+//go:build linux
+
 package main
 
 import (
@@ -7,18 +9,6 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
-)
-
-// 媒体键命令(来自耳机/键盘的原生按键)。
-type mkey int
-
-const (
-	mPlayPause mkey = iota
-	mVolUp
-	mVolDown
-	mMute
-	mNext
-	mPrev
 )
 
 // evdev 键码(linux/input-event-codes.h)。

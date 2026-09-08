@@ -339,11 +339,7 @@ func ProbeChannels(name string) (minCh, maxCh int, err error) {
 	return int(lo), int(hi), nil
 }
 
-// AlsaDevice 是可供选择的 playback 输出设备。
-type AlsaDevice struct {
-	Name  string // "hw:<card>,<dev>"
-	Label string // 可读描述
-}
+// AlsaDevice 已在 alsa_common.go 跨平台定义。
 
 var pcmPRe = regexp.MustCompile(`^pcm(\d+)p$`)
 
