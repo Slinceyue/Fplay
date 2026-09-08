@@ -153,6 +153,7 @@ func run() error {
 
 	// 监听耳机/键盘媒体键(暂停、音量、上下曲、静音)。
 	media := make(chan mkey, 16)
+	ensureMediaKeyAccess() // 启动时自检 /dev/input 权限,缺则 setfacl
 	go mediaListener(media)
 
 	// GNOME 媒体控制走 MPRIS:顶栏常驻卡片,切歌/暂停静默更新不弹窗。
