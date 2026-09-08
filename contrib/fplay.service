@@ -1,0 +1,34 @@
+# Fplay 无头播放器 systemd 单元(嵌入式自启 + 看门狗)。
+# 安装: make install-service   (或手动复制到 /etc/systemd/system/fplay.service)
+# 自启: systemctl enable --now fplay
+#
+# Type=notify + WatchdogSec:进程需定期 sd_notify(WATCHDOG=1),超 30s 没喂狗
+# systemd 认为进程卡死并自动重启。
+[Unit]
+Description=Fplay FLAC Player
+After=sound.target local-fs.target
+Wants=local-fs.target
+
+[Service]
+Type=notify
+ExecStart=/usr/local/bin/fplay
+# 媒体键/权限已在运行时自检(setfacl),无需 root;建议放 input/audio 组。
+User=root
+Group=root
+Restart=always
+RestartSec=2
+WatchdogSec=30
+
+# 音乐目录:显式库放这里(冒号分隔),或靠自动扫描挂载点。
+Environment=FPLAY_LIB=
+
+# 无终端:stdin 为 null → 程序进入服务模式(stdin EOF 不退出)。
+StandardInput=null
+StandardOutput=journal
+StandardError=journal
+
+# 收紧一点权限;需要 ALSA + /dev/input。
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

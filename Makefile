@@ -16,7 +16,7 @@ OUTDIR  := build
 GO      ?= go
 LDFLAGS := -s -w
 
-.PHONY: build run test test-race vet fmt lint cross install clean
+.PHONY: build run test test-race vet fmt lint cross install install-service clean
 
 build:
 	@mkdir -p $(OUTDIR)
@@ -54,6 +54,20 @@ cross:
 install: build
 	install -m 0755 $(OUTDIR)/$(BINARY) $(HOME)/.local/bin/$(BINARY)
 	@echo "已安装到 $(HOME)/.local/bin/$(BINARY)"
+
+# 嵌入式 systemd 服务安装(需 root):
+#   make install-service       安装 + enable + start
+#   make install-service-run   仅安装 + enable
+install-service: build
+	@echo "== 安装 systemd 服务(需要 sudo) =="
+	sudo install -m 0644 contrib/fplay.service /etc/systemd/system/fplay.service
+	sudo install -m 0755 $(OUTDIR)/$(BINARY) /usr/local/bin/fplay
+	sudo systemctl daemon-reload
+	sudo systemctl enable fplay
+
+install-service-run: install-service
+	sudo systemctl restart fplay
+	@echo "已启动服务;看日志: journalctl -u fplay -f"
 
 clean:
 	rm -rf $(OUTDIR)

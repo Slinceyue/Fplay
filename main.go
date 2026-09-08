@@ -112,7 +112,12 @@ func run() error {
 		a.stop()
 		a.save()
 	}()
-	_ = sig
+	go func() { // 收到信号即优雅退出(systemd/嵌入式常用)
+		<-sig
+		a.stop()
+		a.save()
+		os.Exit(0)
+	}()
 
 	// 库扫描(本地 + U盘/SD 挂载的 music);把最终目录去重记回 a.dirs
 	a.dirs = uniqStrs(libs)
@@ -141,6 +146,14 @@ func run() error {
 	// 播放进度 JSON 事件(供前端)
 	go a.ticker()
 
+	// systemd Type=notify:告诉 systemd 我们 READY,并按 WatchdogSec 的一半喂狗。
+	sdNotifyReady()
+	stopWd := make(chan struct{})
+	defer close(stopWd)
+	if sdWatchdogEnabled() {
+		go sdWatchdogLoop(10*time.Second, stopWd)
+	}
+
 	// 交互提示
 	a.interactive = term.IsTerminal(int(os.Stdin.Fd()))
 	r := bufio.NewReader(os.Stdin)
@@ -151,6 +164,10 @@ func run() error {
 	for {
 		line, err := r.ReadString('\n')
 		if err == io.EOF {
+			// 服务模式(systemd 把 stdin 设 null):EOF 不退出,等信号。
+			if !a.interactive {
+				select {}
+			}
 			return nil
 		}
 		if err != nil {
