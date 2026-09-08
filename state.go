@@ -26,11 +26,12 @@ func stateFile() string {
 
 // State 需要跨会话记住的东西。
 type State struct {
-	Folder  string `json:"folder"`
-	Mode    string `json:"mode"`
-	Device  string `json:"device"`  // ALSA 输出设备,如 hw:1,0
-	Current string `json:"current"` // 最近播放/正在播的歌曲
-	Volume  int    `json:"volume"`  // 上次音量 0..150(0=未保存,用默认)
+	Folder  string   `json:"folder"`
+	Mode    string   `json:"mode"`
+	Device  string   `json:"device"`  // ALSA 输出设备,如 hw:1,0
+	Current string   `json:"current"` // 最近播放/正在播的歌曲
+	Volume  int      `json:"volume"`  // 上次音量 0..150(0=未保存,用默认)
+	Dirs    []string `json:"dirs"`    // 显式添加的音乐目录
 }
 
 func loadState() State {

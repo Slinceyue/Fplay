@@ -28,6 +28,8 @@ type track struct {
 	Path   string `json:"path"`
 	Title  string `json:"title"`
 	Artist string `json:"artist"`
+
+	lrc []lrcLine // 同名 .lrc(不输出 JSON)
 }
 
 type app struct {
@@ -44,6 +46,8 @@ type app struct {
 
 	interactive bool
 	diag        bool
+
+	dirs []string // 持久化的音乐目录
 }
 
 func main() {
@@ -79,7 +83,8 @@ func run() error {
 	}
 
 	st := loadState()
-	a := &app{curID: -1, mode: modeSeq, diag: diag}
+	a := &app{curID: -1, mode: modeSeq, diag: diag, dirs: st.Dirs}
+	libs = append(libs, a.dirs...)
 	if st.Mode != "" {
 		a.mode = st.Mode
 	}
@@ -109,8 +114,9 @@ func run() error {
 	}()
 	_ = sig
 
-	// 库扫描(本地 + U盘/SD 挂载的 music)
-	a.rescan(libs)
+	// 库扫描(本地 + U盘/SD 挂载的 music);把最终目录去重记回 a.dirs
+	a.dirs = uniqStrs(libs)
+	a.rescan(a.dirs)
 
 	// 引擎
 	a.eng = startEngine(a.dev, a.ps)
@@ -193,7 +199,13 @@ func (a *app) rescan(extra []string) {
 					if title == "" {
 						title = de.Name()
 					}
-					list = append(list, track{ID: len(list), Path: ap, Title: title, Artist: artist})
+					list = append(list, track{
+						ID:     len(list),
+						Path:   ap,
+						Title:  title,
+						Artist: artist,
+						lrc:    parseLRCFile(ap),
+					})
 				}
 			}
 			return nil
@@ -373,6 +385,7 @@ func (a *app) save() {
 		Device:  a.dev,
 		Current: cur,
 		Volume:  int(a.ps.Vol()),
+		Dirs:    a.dirs,
 	})
 }
 
@@ -432,6 +445,48 @@ func (a *app) command(line string) bool {
 			return true
 		}
 		a.eng.playAt(a.lib[a.curID].Path, a.curID, sec)
+	case "cover":
+		if len(f) < 2 {
+			a.emitErr("用法: cover <id>")
+			return true
+		}
+		id, _ := strconv.Atoi(f[1])
+		if id < 0 || id >= len(a.lib) {
+			a.emitErr("没有该 id")
+			return true
+		}
+		a.emit(map[string]any{"evt": "cover", "id": id, "path": readCover(a.lib[id].Path)})
+	case "lyrics", "lyric":
+		if len(f) < 2 {
+			a.emitErr("用法: lyrics <id> [秒]")
+			return true
+		}
+		id, _ := strconv.Atoi(f[1])
+		if id < 0 || id >= len(a.lib) {
+			a.emitErr("没有该 id")
+			return true
+		}
+		tr := a.lib[id]
+		lines := make([]map[string]any, 0, len(tr.lrc))
+		for _, l := range tr.lrc {
+			lines = append(lines, map[string]any{"t": l.T, "text": l.Text})
+		}
+		cur := map[string]any{}
+		sec := -1.0
+		if len(f) >= 3 {
+			if v, err := strconv.ParseFloat(f[2], 64); err == nil {
+				sec = v
+			}
+		}
+		if sec < 0 && id == a.curID && a.ps.Rate() > 0 {
+			sec = float64(a.ps.Pos()) / float64(a.ps.Rate())
+		}
+		if sec >= 0 {
+			if i := curLRC(tr.lrc, sec); i >= 0 {
+				cur = map[string]any{"t": tr.lrc[i].T, "text": tr.lrc[i].Text}
+			}
+		}
+		a.emit(map[string]any{"evt": "lyrics", "id": id, "n": len(lines), "lines": lines, "current": cur, "at": sec})
 	case "pause", "resume":
 		if a.ps.Playing() {
 			a.ps.SetPaused(!a.ps.Paused())
@@ -514,8 +569,34 @@ func (a *app) ticker() {
 	for range t.C {
 		a.mu.Lock()
 		if a.ps.Playing() {
-			a.emit(map[string]any{"evt": "tick", "pos": a.ps.Pos(), "rate": a.ps.Rate(), "total": a.ps.Total()})
+			ev := map[string]any{"evt": "tick", "pos": a.ps.Pos(), "rate": a.ps.Rate(), "total": a.ps.Total()}
+			if a.curID >= 0 && a.curID < len(a.lib) {
+				tr := a.lib[a.curID]
+				if len(tr.lrc) > 0 {
+					sec := 0.0
+					if r := a.ps.Rate(); r > 0 {
+						sec = float64(a.ps.Pos()) / float64(r)
+					}
+					if i := curLRC(tr.lrc, sec); i >= 0 {
+						ev["line"] = tr.lrc[i].Text
+					}
+				}
+			}
+			a.emit(ev)
 		}
 		a.mu.Unlock()
 	}
+}
+
+// uniqStrs 保持顺序去重。
+func uniqStrs(in []string) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, x := range in {
+		if x != "" && !seen[x] {
+			seen[x] = true
+			out = append(out, x)
+		}
+	}
+	return out
 }
