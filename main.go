@@ -29,11 +29,11 @@ type app struct {
 	curIdx  int      // 正在播的下标(-1 无)
 	current string   // 正在播的完整路径
 
-	mode    string
-	lyricOn bool
-	listOn  bool // 是否显示文件列表(默认关:歌词为主)
-	lyricSz int  // 歌词"大小":当前句上下各留几行(滚轮调 1..4)
-	errMsg  string
+	mode     string
+	lyricOn  bool
+	listOn   bool // 是否显示文件列表(默认关:歌词为主)
+	lyricGap int  // 歌词大屏当前句上下各留几行(+/ - 调,1..4)
+	errMsg   string
 
 	lyrics  []lrcLine
 	lrcSong string // 已解析歌词对应的歌
@@ -111,7 +111,7 @@ func run() error {
 	home, _ := os.UserHomeDir()
 	st := loadState()
 
-	a := &app{mode: "顺序", lyricOn: true, listOn: true, lyricSz: 1, curIdx: -1, ps: &playState{}}
+	a := &app{mode: "顺序", lyricOn: true, listOn: true, lyricGap: 1, curIdx: -1, ps: &playState{}}
 	a.ps.SetVol(50) // 默认音量 50%
 	if st.Volume > 0 {
 		a.ps.SetVol(int32(st.Volume)) // 恢复上次音量
@@ -663,6 +663,10 @@ func (a *app) handleChar(ch rune, keys <-chan key) {
 		a.changeVol(5)
 	case '[', '-':
 		a.changeVol(-5)
+	case '}':
+		a.setLyricGap(a.lyricGap + 1) // 歌词行距 +1
+	case '{':
+		a.setLyricGap(a.lyricGap - 1) // 歌词行距 -1
 	case 'v', 'V':
 		a.toggleMute()
 	case 'f', 'F':
@@ -939,7 +943,7 @@ func (a *app) render() {
 
 	// ---- 底部帮助(两行;第二行用 WriteString 写,不带 \r\n,避免占满高度时把画面顶滚一行)----
 	emit(&sb, line(" Enter 播放 · Space 暂停 · t 列表 · n/b 切歌 · ← → 快退/快进(±10s) · f 目录 · o 输出 · q 退出 · l 歌词", w, cDim))
-	sb.WriteString(line(" 音量 ]加 [减(-也可)  v静音     字号:放大 Ctrl+Shift+=  缩小 Ctrl+-", w, cDim))
+	sb.WriteString(line(" 音量 ]加 [减(-也可)  v静音  行距 }加 {减  字号:放大 Ctrl+Shift+=  缩小 Ctrl+-", w, cDim))
 
 	sb.WriteString("\x1b[J")
 	os.Stdout.WriteString(sb.String())
@@ -1104,14 +1108,15 @@ func (a *app) lyricWindow(ls []lrcLine, w, rows int) []string {
 	return out
 }
 
-func (a *app) setLyricSz(v int) {
+// setLyricGap 调整歌词大屏当前句上下各留几行(1..4)。
+func (a *app) setLyricGap(v int) {
 	if v < 1 {
 		v = 1
 	}
 	if v > 4 {
 		v = 4
 	}
-	a.lyricSz = v
+	a.lyricGap = v
 }
 
 // centerLine 文本按屏幕宽度水平居中。
@@ -1123,13 +1128,13 @@ func centerLine(s string, w int, color string) string {
 	return line(strings.Repeat(" ", lp)+s, w, color)
 }
 
-// drawLyricCenter 大屏:正在播的句子固定在垂直正中,前后句按 lyricSz 行距排开,整屏水平居中。
+// drawLyricCenter 大屏:正在播的句子固定在垂直正中,前后句按 lyricGap 行距排开,整屏水平居中。
 func (a *app) drawLyricCenter(sb *strings.Builder, w, rows int) {
 	ls := a.lyrics
 	if len(ls) == 0 {
 		return
 	}
-	step := a.lyricSz
+	step := a.lyricGap
 	if step < 1 {
 		step = 1
 	}
