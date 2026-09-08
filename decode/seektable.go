@@ -8,6 +8,7 @@ import (
 	"reflect"
 	"sync"
 	"time"
+	"unsafe"
 
 	"github.com/mewkiz/flac"
 	"github.com/mewkiz/flac/meta"
@@ -97,14 +98,37 @@ func (c *SeekTableCache) ApplyToStream(s *flac.Stream, path string) bool {
 	return setSeekTable(s, st)
 }
 
-// setSeekTable 通过反射 + unsafe 写入 s.seekTable。
+// setSeekTable 通过 reflect 定位私有字段地址 + unsafe 写入 s.seekTable。
 func setSeekTable(s *flac.Stream, st *meta.SeekTable) bool {
-	v := reflect.ValueOf(s).Elem().FieldByName("seekTable")
-	if !v.IsValid() || !v.CanSet() {
+	f := fieldPtr(s, "seekTable")
+	if f == nil {
 		return false
 	}
-	v.Set(reflect.ValueOf(st))
+	*(**meta.SeekTable)(f) = st
 	return true
+}
+
+// streamSeekTable 读 s.seekTable 私有字段(反射定位 + unsafe 取值)。
+func streamSeekTable(s *flac.Stream) *meta.SeekTable {
+	f := fieldPtr(s, "seekTable")
+	if f == nil {
+		return nil
+	}
+	return *(**meta.SeekTable)(f)
+}
+
+// fieldPtr 返回 s 里名为 name 的字段的 unsafe 指针;找不到返回 nil。
+func fieldPtr(s *flac.Stream, name string) unsafe.Pointer {
+	v := reflect.ValueOf(s)
+	if v.Kind() != reflect.Ptr || v.IsNil() {
+		return nil
+	}
+	ev := v.Elem()
+	f := ev.FieldByName(name)
+	if !f.IsValid() {
+		return nil
+	}
+	return unsafe.Pointer(f.UnsafeAddr())
 }
 
 // 私有手序列化:每个 SeekPoint 18 字节(uint64+uint64+uint16),前缀 4 字节点数。

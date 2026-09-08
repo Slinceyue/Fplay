@@ -3,12 +3,10 @@ package decode
 import (
 	"io"
 	"os"
-	"reflect"
 	"time"
 
 	"github.com/mewkiz/flac"
 	"github.com/mewkiz/flac/frame"
-	"github.com/mewkiz/flac/meta"
 )
 
 type Format struct {
@@ -35,37 +33,11 @@ func NewDecoder(path string) (*Decoder, error) {
 		f.Close()
 		return nil, err
 	}
-	// 优先挂回缓存的 SeekTable(跨进程/跨播放复用),让大跨度快进瞬时。
-	if seekCache.ApplyToStream(stream, path) {
-		return &Decoder{path: path, stream: stream, file: f}, nil
-	}
-	// 没缓存:后台扫一遍建表 + 落盘(用户继续播放,不阻塞)。
-	d := &Decoder{path: path, stream: stream, file: f}
-	go d.buildAndCacheSeekTable()
-	return d, nil
-}
-
-// buildAndCacheSeekTable 触发库扫描整首建表,然后把表落盘到磁盘。
-func (d *Decoder) buildAndCacheSeekTable() {
-	s := d.stream
-	if s == nil || s.Info == nil {
-		return
-	}
-	// Seek 到中点会触发 makeSeekTable(库自己扫整首)
-	if _, err := s.Seek(s.Info.NSamples / 2); err != nil {
-		return
-	}
-	// 拉一下内部的 seekTable 私有字段
-	v := reflect.ValueOf(s).Elem().FieldByName("seekTable")
-	if !v.IsValid() {
-		return
-	}
-	if v.IsNil() {
-		return
-	}
-	if st, ok := v.Interface().(*meta.SeekTable); ok && st != nil {
-		seekCache.Save(d.path, st, s.Info)
-	}
+	// 挂回磁盘缓存的 SeekTable(跨进程/跨播放复用)。
+	// 注意:这里绝不后台建表 —— 那会和正在解码的流抢同一 reader 导致崩溃。
+	// 首次真正需要跳转时,由引擎单线程懒建并落盘(见 SeekSample)。
+	_ = seekCache.ApplyToStream(stream, path)
+	return &Decoder{path: path, stream: stream, file: f}, nil
 }
 
 func (d *Decoder) Format() *Format {
@@ -83,6 +55,7 @@ func (d *Decoder) Duration() time.Duration {
 }
 
 // SeekSample 跳到包含 sample 的那一帧开头,返回实际起始采样号(<=sample)。
+// 只在"播放协程单线程内"调用(engine 的 runTrack),不与 Next 并发。
 func (d *Decoder) SeekSample(sample int64) (int64, error) {
 	if sample < 0 {
 		sample = 0
@@ -91,7 +64,20 @@ func (d *Decoder) SeekSample(sample int64) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
+	// 首次 Seek 会让库内部建表,这里顺手落盘,下次直接复用磁盘缓存。
+	d.saveSeekTableIfAny()
 	return int64(pos), nil
+}
+
+// saveSeekTableIfAny 把流内部已建好的 SeekTable 反射出来落盘;失败静默。
+func (d *Decoder) saveSeekTableIfAny() {
+	if d.stream == nil || d.stream.Info == nil {
+		return
+	}
+	st := streamSeekTable(d.stream)
+	if st != nil {
+		seekCache.Save(d.path, st, d.stream.Info)
+	}
 }
 
 func (d *Decoder) Next() (*frame.Frame, error) {
