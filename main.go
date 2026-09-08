@@ -171,7 +171,6 @@ func run() error {
 	tick := time.NewTicker(100 * time.Millisecond) // 100ms 重画 + 平滑内插到 1/8 字符精度
 	defer tick.Stop()
 
-	notifSig := ""
 	for !a.quit {
 		select {
 		case <-sig:
@@ -188,20 +187,9 @@ func run() error {
 			continue
 		}
 		// MPRIS 媒体卡静默同步:切歌/暂停/继续都反映在卡片上,不弹窗。
-		sig := a.current
-		switch {
-		case !a.ps.Playing():
-			sig += "|S"
-		case a.ps.Paused():
-			sig += "|P"
-		default:
-			sig += "|R"
-		}
-		if sig != notifSig {
-			notifSig = sig
-			if mp != nil {
-				mp.update(a.current, a.ps.Playing(), a.ps.Paused())
-			}
+		// update 内部判断路径/状态是否变化,无变化就 no-op(代价低)。
+		if mp != nil {
+			mp.update(a.current, a.ps.Playing(), a.ps.Paused())
 		}
 		a.render()
 	}
@@ -910,7 +898,7 @@ func (a *app) render() {
 		emit(&sb, line("  ⚠ "+a.errMsg, w, cRed))
 	}
 
-	// ---- 底部帮助(最后一行不加 \r\n,避免占满高度时把画面顶滚一行)----
+	// ---- 底部帮助(两行;第二行用 WriteString 写,不带 \r\n,避免占满高度时把画面顶滚一行)----
 	emit(&sb, line(" Enter 播放 · Space 暂停 · t 列表 · n/b 切歌 · ← → 快退/快进(±10s) · f 目录 · o 输出 · q 退出 · l 歌词", w, cDim))
 	sb.WriteString(line(" 音量 ]加 [减(-也可)  v静音     字号:放大 Ctrl+Shift+=  缩小 Ctrl+-", w, cDim))
 

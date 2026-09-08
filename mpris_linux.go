@@ -61,7 +61,8 @@ func (m *mpris) send(k mkey) {
 
 // update 仅在播放状态/歌曲变化时刷新 MPRIS 属性,不产生弹窗。
 // 锁粒度:把"读 FLAC 元数据"这种可能阻塞 IO 的动作放在锁外,
-//       锁内只做"复制状态字段 + 构造 D-Bus 信号 + emit"。
+//
+//	锁内只做"复制状态字段 + 构造 D-Bus 信号 + emit"。
 func (m *mpris) update(path string, playing, paused bool) {
 	if m == nil || m.bus == nil {
 		return
