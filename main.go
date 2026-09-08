@@ -56,10 +56,21 @@ type app struct {
 	posBaseAt time.Time // 基准对应的墙钟
 	posMu     sync.Mutex
 
+	errors []string // 最近的错误历史(供 -diag 排错)
+
 	triedFallback bool // 本曲是否已自动换过一次设备
 }
 
 func main() {
+	diag := false
+	for _, a := range os.Args[1:] {
+		if a == "-diag" || a == "--diag" {
+			diag = true
+		}
+	}
+	if diag {
+		_ = os.Setenv("FPLAY_DIAG", "1")
+	}
 	if unlock := acquireLock(); unlock == nil {
 		fmt.Fprintln(os.Stderr, "FlacPlayer 已在运行:请先退出旧实例(q)再启动。")
 		os.Exit(1)
@@ -203,6 +214,29 @@ func (a *app) shutdown() {
 	}
 	a.save()
 	a.restoreAudio()
+	if os.Getenv("FPLAY_DIAG") == "1" {
+		a.dumpDiag()
+	}
+}
+
+// dumpDiag 把当前状态打 stderr(仅在 -diag 模式下调用)。
+func (a *app) dumpDiag() {
+	fmt.Fprintln(os.Stderr, "==== Fplay -diag ====")
+	fmt.Fprintf(os.Stderr, "state: playing=%v paused=%v vol=%d%% muted=%v\n",
+		a.ps.Playing(), a.ps.Paused(), a.ps.Vol(), a.muted)
+	fmt.Fprintf(os.Stderr, "rate=%dHz total=%d samples pos=%d (base)\n",
+		a.ps.Rate(), a.ps.Total(), a.posBase)
+	fmt.Fprintf(os.Stderr, "current=%s\nmode=%s device=%s\n", a.current, a.mode, a.dev)
+	fmt.Fprintf(os.Stderr, "listOn=%v lyricOn=%v\n", a.listOn, a.lyricOn)
+	if len(a.errors) == 0 {
+		fmt.Fprintln(os.Stderr, "errors: (none)")
+	} else {
+		fmt.Fprintln(os.Stderr, "errors:")
+		for _, e := range a.errors {
+			fmt.Fprintln(os.Stderr, "  -", e)
+		}
+	}
+	fmt.Fprintln(os.Stderr, "==== end ====")
 }
 
 // loadLyrics 缓存当前歌曲的 .lrc(避免每帧读盘)。
@@ -306,6 +340,11 @@ func (a *app) playFrom(path string, idx int, sec float64) {
 
 func (a *app) handleRes(r resMsg) {
 	if r.reason == "err" {
+		// 累积错误历史(给 -diag 看)
+		if len(a.errors) > 50 {
+			a.errors = a.errors[1:]
+		}
+		a.errors = append(a.errors, time.Now().Format("15:04:05")+" "+r.errText)
 		// 设备打不开时自动换一个可用设备继续(同进度),只自动试一次。
 		if !a.triedFallback && a.current != "" &&
 			(strings.Contains(r.errText, "输出设备") || strings.Contains(r.errText, "打开 ")) {
