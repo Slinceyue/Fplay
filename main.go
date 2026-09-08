@@ -146,6 +146,9 @@ func run() error {
 	// 播放进度 JSON 事件(供前端)
 	go a.ticker()
 
+	// U盘/SD 热插拔自动重扫
+	go a.hotplug()
+
 	// systemd Type=notify:告诉 systemd 我们 READY,并按 WatchdogSec 的一半喂狗。
 	sdNotifyReady()
 	stopWd := make(chan struct{})
