@@ -4,3 +4,4 @@
 /tmpdev/
 *.test
 *.out
+/build/
