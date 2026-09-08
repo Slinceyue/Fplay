@@ -60,25 +60,36 @@ func (m *mpris) send(k mkey) {
 // ---------- 状态更新(由主循环调用,静默)----------
 
 // update 仅在播放状态/歌曲变化时刷新 MPRIS 属性,不产生弹窗。
+// 锁粒度:把"读 FLAC 元数据"这种可能阻塞 IO 的动作放在锁外,
+//       锁内只做"复制状态字段 + 构造 D-Bus 信号 + emit"。
 func (m *mpris) update(path string, playing, paused bool) {
 	if m == nil || m.bus == nil {
 		return
 	}
-	if path == "" {
-		if !playing {
-			m.setStatus("Stopped", "")
+	// 决定要不要切歌:锁内读 cur,避免和并发 update 撞。
+	m.mu.Lock()
+	samePath := m.cur == path && path != ""
+	m.mu.Unlock()
+
+	var title, artist, art string
+	if path != "" && !samePath {
+		// 锁外读文件(可能阻塞几百毫秒~几秒)
+		t, ar, ap := flacMeta(path)
+		title, artist, art = t, ar, ap
+		if title == "" {
+			title = filepath.Base(path)
 		}
-		return
 	}
+
+	// 临界区:写入状态 + 构造 D-Bus 信号 + emit 一次性原子完成。
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	if m.cur != path {
+	if path != "" && path != m.cur {
 		m.cur = path
-		m.title, m.artist, m.art = flacMeta(path) // 复用封面/标签提取
-		if m.title == "" {
-			m.title = filepath.Base(path)
-		}
+		m.title = title
+		m.artist = artist
+		m.art = art
 		m.lengthUs = 0
 	}
 	m.playing = playing
@@ -90,10 +101,11 @@ func (m *mpris) update(path string, playing, paused bool) {
 	} else if paused {
 		status = "Paused"
 	}
-	m.setStatus(status, path)
+	m.emitStatusLocked(status, path)
 }
 
-func (m *mpris) setStatus(status, path string) {
+// emitStatusLocked 必须在持锁状态下调用;构造属性 map 并 emit 状态变更。
+func (m *mpris) emitStatusLocked(status, path string) {
 	meta := map[string]dbus.Variant{
 		"mpris:trackid": dbus.MakeVariant(dbus.ObjectPath("/org/flacplayer/track")),
 		"xesam:title":   dbus.MakeVariant(m.title),
@@ -109,7 +121,6 @@ func (m *mpris) setStatus(status, path string) {
 	} else if path != "" {
 		meta["xesam:url"] = dbus.MakeVariant(path)
 	}
-
 	changed := map[string]dbus.Variant{
 		"PlaybackStatus": dbus.MakeVariant(status),
 		"Metadata":       dbus.MakeVariant(meta),
