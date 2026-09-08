@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -49,6 +51,10 @@ type app struct {
 
 	muted   bool  // 静音
 	muteVol int32 // 静音前音量,恢复用
+
+	posBase   int64     // 引擎位置基准(样本)
+	posBaseAt time.Time // 基准对应的墙钟
+	posMu     sync.Mutex
 
 	triedFallback bool // 本曲是否已自动换过一次设备
 }
@@ -161,7 +167,7 @@ func run() error {
 
 	keys := make(chan key, 32)
 	go keyLoop(keys)
-	tick := time.NewTicker(250 * time.Millisecond)
+	tick := time.NewTicker(100 * time.Millisecond) // 100ms 重画 + 平滑内插到 1/8 字符精度
 	defer tick.Stop()
 
 	notifSig := ""
@@ -272,6 +278,15 @@ func (a *app) restoreAudio() {
 	a.audioStopped = false
 }
 
+// markPosBase 记"当前引擎位置 = samplesNow,墙钟 = now"为进度条平滑的基准。
+// 进度条渲染时:pos = samplesNow + (now - posBaseAt) * rate。
+func (a *app) markPosBase(samplesNow int64) {
+	a.posMu.Lock()
+	a.posBase = samplesNow
+	a.posBaseAt = time.Now()
+	a.posMu.Unlock()
+}
+
 // doPlay 在 audio 列表里播 files[i](i<0 视为停止)。
 func (a *app) doPlay(i int) {
 	if i < 0 || i >= len(a.files) {
@@ -284,6 +299,7 @@ func (a *app) doPlay(i int) {
 	a.curIdx = i
 	a.current = a.files[i]
 	a.eng.play(a.current, i)
+	a.markPosBase(0) // 新一首歌从 0 起算
 	a.listOn = false // 播放即隐藏列表,歌词为主;按 t 随时调出列表
 	a.save()         // 记住正在播的歌(供检测脚本/下次打开)
 }
@@ -294,6 +310,7 @@ func (a *app) playFrom(path string, idx int, sec float64) {
 	a.curIdx = idx
 	a.current = path
 	a.eng.playAt(path, idx, sec)
+	a.markPosBase(int64(sec * float64(a.ps.Rate())))
 	a.listOn = false
 	a.save()
 }
@@ -536,6 +553,8 @@ func (a *app) handleMedia(m mkey) {
 // togglePause 暂停/继续(正在播才有效)。
 func (a *app) togglePause() {
 	if a.ps.Playing() {
+		// 切换前先抓当前位置作为新基准(暂停/继续时渲染按基准+流逝推算)
+		a.markPosBase(a.posBase + int64(time.Since(a.posBaseAt)*time.Duration(a.ps.Rate())/time.Second))
 		a.ps.SetPaused(!a.ps.Paused())
 	}
 }
@@ -898,18 +917,32 @@ func (a *app) render() {
 	os.Stdout.WriteString(sb.String())
 }
 
-// progressRow 组合一条进度条。
+// progressRow 组合一条平滑进度条:填充精度 1/8,位置按"上次引擎上报 + 经过时间"实时算。
 func (a *app) progressRow(w int) string {
-	if a.ps.Rate() <= 0 {
+	rate := a.ps.Rate()
+	if rate <= 0 {
 		return line("  --:-- / --:--", w, "")
 	}
-	rate := a.ps.Rate()
-	cur := float64(a.ps.Pos()) / float64(rate)
-	dur := 0.0
-	if a.ps.Total() > 0 {
-		dur = float64(a.ps.Total()) / float64(rate)
+	// 实时位置:暂停时停在上次;播放时=引擎位置+(now-startedAt)*rate
+	base := atomic.LoadInt64(&a.posBase) // 上次引擎上报时的 pos(样本)
+	baseAt := a.posBaseAt
+	if a.ps.Paused() || a.posBaseAt.IsZero() {
+		baseAt = time.Time{} // 暂停:不再前进
 	}
-	left := "  " + mmss(cur) + " / " + mmss(dur) + "  "
+	curSamples := base
+	if !baseAt.IsZero() {
+		curSamples += int64(time.Since(baseAt) * time.Duration(rate) / time.Second)
+	}
+	if curSamples < 0 {
+		curSamples = 0
+	}
+	cur := float64(curSamples) / float64(rate)
+	dur := 0.0
+	if t := a.ps.Total(); t > 0 {
+		dur = float64(t) / float64(rate)
+	}
+
+	left := "  " + mmssTenth(cur) + " / " + mmssTenth(dur) + "  "
 	bw := 30
 	if bw > w-dispW(left)-6 {
 		bw = w - dispW(left) - 6
@@ -921,9 +954,40 @@ func (a *app) progressRow(w int) string {
 	if dur > 0 {
 		pct = cur / dur
 	}
-	fill := int(pct * float64(bw))
-	barTxt := left + "[" + strings.Repeat("█", fill) + strings.Repeat("░", bw-fill) + "]"
+	if pct < 0 {
+		pct = 0
+	} else if pct > 1 {
+		pct = 1
+	}
+
+	// 1/8 精度填充:总格数 = bw*8,按整 8 取整 + 余数用部分块字符
+	const blocks = " ▏▎▍▌▋▊█" // 索引 0..7,7=满
+	total := bw * 8
+	done := int(pct * float64(total))
+	full := done / 8
+	part := done % 8
+	bar := strings.Repeat("█", full)
+	if part > 0 {
+		bar += string(blocks[part])
+	}
+	if tail := bw - full - 1; tail > 0 {
+		bar += strings.Repeat("░", tail)
+	} else if tail == 0 {
+		// 没余数且刚好满
+	}
+	barTxt := left + "[" + bar + "]"
 	return line(barTxt+fmt.Sprintf("  %3.0f%%", pct*100), w, "")
+}
+
+// mmssTenth 01:23.4 形式,十秒一秒内显示 0:00.0。
+func mmssTenth(v float64) string {
+	if v < 0 {
+		v = 0
+	}
+	m := int(v) / 60
+	s := int(v) % 60
+	d := int((v - float64(int(v))) * 10)
+	return fmt.Sprintf("%d:%02d.%d", m, s, d)
 }
 
 // drawList 文件列表,窗口随 cursor 滚动。
