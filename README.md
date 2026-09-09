@@ -20,7 +20,7 @@ Go 1.26+;主要依赖:`mewkiz/flac`(解码)、`ebitengine/purego`(ALSA)、`godbu
 ## 构建 / 运行
 
 ```bash
-# 一键:lint / 单测 / 交叉编译(linux amd64·arm64、windows amd64)
+# 一键:lint / 单测 / 交叉编译(linux amd64、linux arm64)
 make lint && make test && make cross
 
 # 桌面版(建议装到 PATH 后敲 Fplay)
@@ -30,8 +30,8 @@ Fplay
 # 交叉产物
 build/linux-amd64/Fplay
 build/linux-arm64/Fplay      # 嵌入式主目标
-build/windows-amd64/Fplay.exe
 ```
+> Windows(桌面)在独立 **win** 分支;本分支为 Linux 无头播放器。
 
 ## 桌面版(main)操作
 
@@ -81,7 +81,7 @@ make test-race
 - `main`:稳定桌面版(当前 HEAD 基线)
 - `feature/embedded`:无头/嵌入式开发中(声卡已虚拟接入 Debian 12 模拟器验证)
 
-后续:Windows 音频后端(WASAPI)、嵌入式 LCD/触屏前端、真 PCB(arm64)联调。
+后续:嵌入式 LCD/触屏前端、真 PCB(arm64)联调;Windows(桌面)在 `win` 分支。
 
 ## License
 
