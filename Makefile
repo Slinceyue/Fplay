@@ -7,7 +7,7 @@
 #   make vet           go vet ./...
 #   make fmt           检查格式(gofmt -l)
 #   make lint          gofmt + go vet
-#   make cross         交叉编译到 build/ 目录:linux/amd64、linux/arm64、windows/amd64
+#   make cross         交叉编译到 build/ 目录:linux/amd64、linux/arm64
 #   make install       安装到 ~/.local/bin/Fplay
 #   make clean         清掉 build/
 
@@ -42,14 +42,12 @@ lint: fmt vet
 
 # 交叉编译: 目标目录 build/<os>-<arch>/Fplay[.exe]
 cross:
-	@mkdir -p $(OUTDIR)/linux-amd64 $(OUTDIR)/linux-arm64 $(OUTDIR)/windows-amd64
+	@mkdir -p $(OUTDIR)/linux-amd64 $(OUTDIR)/linux-arm64
 	@echo "== linux/amd64 =="
 	GOOS=linux  GOARCH=amd64 CGO_ENABLED=0 $(GO) build -ldflags '$(LDFLAGS)' -trimpath -o $(OUTDIR)/linux-amd64/$(BINARY) .
 	@echo "== linux/arm64 (嵌入式 PCB 主目标) =="
 	GOOS=linux  GOARCH=arm64 CGO_ENABLED=0 $(GO) build -ldflags '$(LDFLAGS)' -trimpath -o $(OUTDIR)/linux-arm64/$(BINARY) .
-	@echo "== windows/amd64 =="
-	GOOS=windows GOARCH=amd64 $(GO) build -ldflags '$(LDFLAGS)' -trimpath -o $(OUTDIR)/windows-amd64/$(BINARY).exe .
-	@ls -lh $(OUTDIR)/*/$(BINARY) $(OUTDIR)/windows-amd64/$(BINARY).exe 2>/dev/null
+	@ls -lh $(OUTDIR)/*/$(BINARY) 2>/dev/null
 
 install: build
 	install -m 0755 $(OUTDIR)/$(BINARY) $(HOME)/.local/bin/$(BINARY)
