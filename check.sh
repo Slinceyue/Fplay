@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# 检测"当前正在播的 FLAC"与"ALSA 设备实际格式"是否逐位一致(直出/重采样/降位)。
+# 检测"当前正在播的 FLAC"与"音频设备实际格式"是否逐位一致(直出/重采样/降位)。
 # 用法:./check.sh [flaccheck 二进制路径]
-# 说明:从 ~/.config/flacplayer/state.json 自动取正在播的歌与输出设备;
-#       需在 flacplayer 播放过程中,另开一个终端运行。
+# 说明:flaccheck 自己会从 ~/.config/flacplayer/state.json 读正在播的歌与设备
+#       (Linux 取 /proc/asound,Windows 取 GetMixFormat);需先播放过一次。
 set -euo pipefail
 
 STATE="$HOME/.config/flacplayer/state.json"
@@ -13,20 +13,9 @@ if [ ! -s "$STATE" ]; then
   exit 2
 fi
 
-read -r CUR < <(python3 -c "import json;print(json.load(open('$STATE')).get('current') or '')")
-read -r DEV < <(python3 -c "import json;print(json.load(open('$STATE')).get('device') or '')")
-
-if [ -z "$CUR" ]; then
-  echo "状态里没有'正在播的歌'。请先在 flacplayer 里播放一首,再运行本脚本。" >&2
-  exit 2
-fi
-
 if [ ! -x "$BIN" ]; then
   echo "编译检测工具 → $BIN"
   go build -o "$BIN" ./tools/check
 fi
 
-if [ -z "$DEV" ]; then
-  exec "$BIN" -flac "$CUR"
-fi
-exec "$BIN" -flac "$CUR" -dev "$DEV"
+exec "$BIN"

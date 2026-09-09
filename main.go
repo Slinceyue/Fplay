@@ -900,12 +900,15 @@ func (a *app) progressRow(w int) string {
 	if t := a.ps.Total(); t > 0 {
 		dur = float64(t) / float64(rate)
 	}
+	// 结尾防抖:引擎按"已写入样本"记 pos,最后一帧可能略超过 total,
+	// 导致 elapsed 跑到总时长之外、百分比冒到 100 以上再跳回——夹到 dur 以内。
+	if dur > 0 && cur > dur {
+		cur = dur
+	}
 
 	left := "  " + mmssTenth(cur) + " / " + mmssTenth(dur) + "  "
-	bw := 30
-	if bw > w-dispW(left)-6 {
-		bw = w - dispW(left) - 6
-	}
+	// 进度条尽量占满整行:屏宽 - 时间文本 - 右侧百分比(留 6 格)。宽屏自动更长,窄屏靠下限兜底。
+	bw := w - dispW(left) - 6
 	if bw < 4 {
 		bw = 4
 	}
@@ -928,10 +931,13 @@ func (a *app) progressRow(w int) string {
 	full := done / 8
 	part := done % 8
 	bar := strings.Repeat("█", full)
+	written := full // 已占用的格数(含部分块那一格)
 	if part > 0 {
 		bar += string(blocks[part])
+		written++
 	}
-	if tail := bw - full - 1; tail > 0 {
+	// 余下补空格,让条始终恰好 bw 格——否则条长在 bw-1/bw 间来回,右缘/百分比会左右跳。
+	if tail := bw - written; tail > 0 {
 		bar += strings.Repeat(" ", tail)
 	}
 	// 不加 [ ] 边框,直接是细条(空余空格融入背景)。

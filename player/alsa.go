@@ -237,11 +237,7 @@ func OpenALSA(name string, sampleRate, channels, bps int) (*ALSA, error) {
 
 // AppendSample 把一个 int32 样本按设备容器编码追加进 buf(小端,内容左对齐)。
 func (a *ALSA) AppendSample(buf []byte, v int32) []byte {
-	u := uint32(v) << a.shift
-	for i := 0; i < a.bytesPer; i++ {
-		buf = append(buf, byte(u>>uint(8*i)))
-	}
-	return buf
+	return appendPCM(buf, v, a.bytesPer, a.shift)
 }
 
 // Write 阻塞写入交错 PCM,直到全部进入设备缓冲(实现 io.Writer 的节流)。

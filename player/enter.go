@@ -1,7 +1,6 @@
-//go:build !linux
+//go:build !linux && !windows
 
-// 非 Linux 平台:player 后端暂未实现(以后 Windows 用 winmm/wasapi)。
-// 给空实现保证 go build 通过。
+// 非 Linux 且非 Windows 平台:player 后端暂未实现。给空实现保证 go build 通过。
 package player
 
 import "io"

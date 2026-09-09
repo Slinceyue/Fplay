@@ -1,6 +1,7 @@
 /.idea/
 /flacplayer
 /flaccheck
+/flaccheck.exe
 /tmpdev/
 *.test
 *.out

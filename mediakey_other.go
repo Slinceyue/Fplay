@@ -1,6 +1,6 @@
-//go:build !linux
+//go:build !linux && !windows
 
-// 非 Linux 没有 /dev/input 媒体键;mediaListener 直接退出。
+// 非 Linux/Windows 没有 /dev/input 媒体键;mediaListener 直接退出。
 package main
 
 func ensureMediaKeyAccess() {}
