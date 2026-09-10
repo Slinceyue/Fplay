@@ -777,13 +777,13 @@ func (a *WASAPI) Pause(on bool) error {
 	return nil
 }
 
-// Close 停止流并释放所有 COM 引用。独占下先等缓冲放完,避免掐掉尾部。
+// Close 停止流并释放所有 COM 引用。
+// 注意:独占下**不做 drain**。独占的 GetCurrentPadding 不可靠(恒返回 bufSize),按它等
+// "放完"会一直等到超时(几百 ms),而这段我们已经停喂数据 → 设备下溢 → 切歌瞬间一长段
+// 电流声。直接 Stop 即可:最多切掉末尾一小截缓冲,但不会下溢出噪音。
 func (a *WASAPI) Close() error {
 	if a.client == nil {
 		return nil
-	}
-	if a.exclusive && a.started {
-		a.drainExclusive()
 	}
 	comCall(a.client, 11) // Stop
 	if a.evt != 0 {
@@ -795,18 +795,6 @@ func (a *WASAPI) Close() error {
 	a.client, a.render, a.dev, a.evt = nil, nil, nil, 0
 	a.fifo = nil
 	return nil
-}
-
-// drainExclusive 独占:等设备把已提交的缓冲放完(pad 归零),最多约 300ms。
-func (a *WASAPI) drainExclusive() {
-	deadline := time.Now().Add(300 * time.Millisecond)
-	for time.Now().Before(deadline) {
-		var pad uint32
-		if !hrOK(comCall(a.client, 6, ap(&pad))) || pad == 0 {
-			return
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
 }
 
 // ProbeChannels Windows 探测声道范围;engine 未实际用到,留 API 完整。
