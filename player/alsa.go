@@ -240,6 +240,12 @@ func (a *ALSA) AppendSample(buf []byte, v int32) []byte {
 	return appendPCM(buf, v, a.bytesPer, a.shift)
 }
 
+// Exclusive Linux ALSA hw 直写本身即独占(逐位直出),恒为 true,供 UI 显示。
+func (a *ALSA) Exclusive() bool { return true }
+
+// DeviceMixFormat Linux 无"共享混音格式"概念(ALSA 直写),返回 ok=false。
+func DeviceMixFormat(name string) (rate, bits, ch int, ok bool) { return 0, 0, 0, false }
+
 // Write 阻塞写入交错 PCM,直到全部进入设备缓冲(实现 io.Writer 的节流)。
 func (a *ALSA) Write(p []byte) (int, error) {
 	if len(p) == 0 {

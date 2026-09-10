@@ -6,12 +6,14 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"syscall"
 	"time"
 
 	"FlacPlayer/player"
+
 	"golang.org/x/term"
 )
 
@@ -76,6 +78,15 @@ func main() {
 	}
 }
 
+// init 调整 GC:独占输出缓冲很小(约 10ms),播放中一次 GC 停顿就可能下溢(实测
+// GOGC=off 能完全消除)。所以关掉自动 GC,改为在切歌/暂停的安全间隙主动 GC
+// (见 engine.runTrack);另设内存软上限做安全阀——万一超长曲目把垃圾攒到上限,
+// 运行时仍会兜底 GC,不至于吃爆内存。
+func init() {
+	debug.SetMemoryLimit(512 << 20)
+	debug.SetGCPercent(-1)
+}
+
 // acquireLock 单实例锁:具体平台实现在 acquire_lock_*.go。
 func acquireLock() func() { return acquireLockPlatform() }
 
@@ -121,7 +132,9 @@ func run() error {
 
 	rawRestore, err := enableRaw()
 	if err != nil {
-		return fmt.Errorf("无法进入原始终端: %w", err)
+		// 不是真终端(IDE 运行窗口/管道等):不进 TUI,退到无界面播放模式。
+		// 这样在 GoLand 普通控制台里也能跑(保留右侧性能分析),只是没有交互界面。
+		return a.runHeadless(err)
 	}
 	// 备用屏幕:启动即全清、退出还原,避免多次启动画面残留叠字。
 	// 开鼠标上报(?1000):滚轮一格=一个事件,GNOME 就不会把一格拆成 5 个↑↓了。
@@ -177,6 +190,64 @@ func run() error {
 		a.render()
 	}
 	return nil
+}
+
+// runHeadless 无界面播放模式:在非真终端环境(IDE 运行窗口/管道)下,不进原始终端、不画
+// TUI,只播放并周期打印状态。目的是让程序能在 GoLand 普通控制台里跑起来(保留右侧性能
+// 分析),方便观察音频路径。rawErr 是进入原始终端失败的原因,仅用于提示。
+func (a *app) runHeadless(rawErr error) error {
+	fmt.Printf("非真终端(%v):进入无界面播放模式。\n", rawErr)
+	fmt.Println("说明:无 TUI,仅播放 + 每 2 秒打印状态;Ctrl+C 退出。要看完整界面请用 Windows Terminal/PowerShell,")
+	fmt.Println("      或 GoLand 运行配置勾选「Emulate terminal in output console」。")
+
+	if a.dev == "" {
+		return fmt.Errorf("没找到输出设备")
+	}
+	// 选一首:优先 state 里记住的 current,其次当前目录第一首 FLAC。
+	path := loadState().Current
+	if fi, err := os.Stat(path); path == "" || err != nil || fi.IsDir() {
+		path = ""
+		if len(a.files) > 0 {
+			path = a.files[0]
+		}
+	}
+	if path == "" {
+		return fmt.Errorf("没有可播放的 FLAC(当前目录 %s)", a.dir)
+	}
+	fmt.Println("播放:", filepath.Base(path))
+
+	a.current = path
+	a.eng = startEngine(a.dev, a.ps)
+	a.eng.play(path, 0)
+
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, os.Interrupt)
+	tick := time.NewTicker(2 * time.Second)
+	defer tick.Stop()
+	for {
+		select {
+		case <-sig:
+			a.eng.stop()
+			time.Sleep(200 * time.Millisecond)
+			return nil
+		case r := <-a.eng.out:
+			switch r.reason {
+			case "done":
+				fmt.Println("播完。")
+				return nil
+			case "err":
+				return fmt.Errorf("播放出错: %s", r.errText)
+			}
+		case <-tick.C:
+			excl := "共享"
+			if a.ps.Exclusive() {
+				excl = "独占"
+			}
+			be := map[int32]string{1: "直出", 0: "重采样", -1: "未知"}[a.ps.BitExact()]
+			fmt.Printf("  进度 %d/%d  %s %s  %d/%dbit  音量 %d%%\n",
+				a.ps.Pos(), a.ps.Total(), excl, be, a.ps.Rate(), a.ps.Bits(), a.ps.Vol())
+		}
+	}
 }
 
 func (a *app) shutdown() {
@@ -772,6 +843,41 @@ func shortDev(dev string) string {
 	return clipW(dev, 18)
 }
 
+// qualText 输出质量摘要:独占/共享 + 直出/重采样 + 文件(→设备)格式——等价 check 脚本。
+func (a *app) qualText() string {
+	if a.ps.Rate() <= 0 {
+		return ""
+	}
+	mode := "共享"
+	if a.ps.Exclusive() {
+		mode = "独占"
+	}
+	q := mode
+	switch a.ps.BitExact() {
+	case 1:
+		q += " 直出"
+	case 0:
+		q += " 重采样"
+	}
+	q += " " + kfmtRate(a.ps.Rate()) + "/" + strconv.Itoa(int(a.ps.Bits())) + "bit"
+	// 共享且设备格式与文件不同时,把设备实际格式也显示出来。
+	if !a.ps.Exclusive() && a.ps.DevRate() > 0 && a.ps.DevRate() != a.ps.Rate() {
+		q += "→" + kfmtRate(a.ps.DevRate()) + "/" + strconv.Itoa(int(a.ps.DevBits())) + "bit"
+	}
+	return q
+}
+
+// kfmtRate 采样率简写:48000→48k,44100→44.1k,96000→96k,192000→192k。
+func kfmtRate(r int64) string {
+	if r <= 0 {
+		return "?"
+	}
+	if r%1000 == 0 {
+		return strconv.FormatInt(r/1000, 10) + "k"
+	}
+	return strconv.FormatFloat(float64(r)/1000, 'f', 1, 64) + "k"
+}
+
 func (a *app) render() {
 	w, h := termSize()
 	if w <= 0 {
@@ -805,12 +911,21 @@ func (a *app) render() {
 	}
 	emit(&sb, line("  "+mark+"  "+now+"   "+name, w, cCyan+cBold))
 
-	// ---- 顶栏:参数 ----
+	// ---- 顶栏:参数(独占/共享 + 位直出,等价 check 脚本,放最前不被裁剪) ----
 	volTxt := fmt.Sprintf("%d%%", a.ps.Vol())
 	if a.muted {
 		volTxt += "（静音）"
 	}
-	emit(&sb, line("  模式 "+a.mode+"    输出 "+shortDev(a.dev)+"    音量 "+volTxt, w, cDim))
+	rest := "模式 " + a.mode + "    输出 " + shortDev(a.dev) + "    音量 " + volTxt
+	info := "  " + rest
+	if q := a.qualText(); q != "" {
+		info = "  " + q + "    " + rest
+	}
+	lc := cDim
+	if a.ps.BitExact() == 0 {
+		lc = cYellow // 被重采样/降位 → 提醒
+	}
+	emit(&sb, line(info, w, lc))
 
 	emit(&sb, sep(w))
 

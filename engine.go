@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"io"
+	"runtime"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -28,6 +29,13 @@ type playState struct {
 	total   int64 // 总样本数(每声道);0 未知
 	rate    int64 // 采样率
 	vol     int32 // 软件音量 0..100
+
+	// 输出质量(开设备时由引擎写入,UI 显示):
+	exclusive int32 // 1=独占直出
+	bitExact  int32 // 1=位完美直出 0=被处理(重采样/降位) -1=未知
+	bits      int32 // 文件位深
+	devRate   int64 // 设备实际采样率
+	devBits   int32 // 设备实际位深
 }
 
 func (s *playState) Playing() bool { return atomic.LoadInt32(&s.playing) == 1 }
@@ -51,6 +59,42 @@ func (s *playState) SetVol(p int32) {
 		p = 150
 	}
 	atomic.StoreInt32(&s.vol, p)
+}
+
+// 输出质量相关(UI 显示独占/共享、是否位直出)。
+func (s *playState) Exclusive() bool  { return atomic.LoadInt32(&s.exclusive) == 1 }
+func (s *playState) BitExact() int32  { return atomic.LoadInt32(&s.bitExact) }
+func (s *playState) Bits() int32      { return atomic.LoadInt32(&s.bits) }
+func (s *playState) DevRate() int64   { return atomic.LoadInt64(&s.devRate) }
+func (s *playState) DevBits() int32   { return atomic.LoadInt32(&s.devBits) }
+
+// setQuality 记录本次播放的输出模式(独占/共享)与是否位直出,供 UI 显示(等价 check 脚本)。
+func (s *playState) setQuality(a *player.ALSA, f *decode.Format, dev string) {
+	atomic.StoreInt32(&s.bits, int32(f.BitsPerSample))
+	if a.Exclusive() {
+		// 独占:设备就按文件格式跑 → 位直出(24bit 用 32bit 容器也算)。
+		atomic.StoreInt32(&s.exclusive, 1)
+		atomic.StoreInt32(&s.bitExact, 1)
+		atomic.StoreInt64(&s.devRate, int64(f.SampleRate))
+		atomic.StoreInt32(&s.devBits, int32(f.BitsPerSample))
+		return
+	}
+	// 共享:比 FILE 与设备混音格式(等价 check 脚本逻辑)。
+	atomic.StoreInt32(&s.exclusive, 0)
+	dr, db, _, ok := player.DeviceMixFormat(dev)
+	if !ok {
+		atomic.StoreInt32(&s.bitExact, -1)
+		return
+	}
+	atomic.StoreInt64(&s.devRate, int64(dr))
+	atomic.StoreInt32(&s.devBits, int32(db))
+	same := dr == f.SampleRate &&
+		(db == f.BitsPerSample || (db > f.BitsPerSample && db <= 32 && f.BitsPerSample <= 24))
+	if same {
+		atomic.StoreInt32(&s.bitExact, 1)
+	} else {
+		atomic.StoreInt32(&s.bitExact, 0)
+	}
 }
 
 type ctrlMsg struct {
@@ -141,6 +185,10 @@ func (e *engine) runTrack(m ctrlMsg) {
 	atomic.StoreInt32(&ps.playing, 1)
 	atomic.StoreInt64(&ps.total, 0)
 
+	// 切歌/重开设备的间隙里主动做一次 GC:独占缓冲很小(约 10ms),播放中一次 GC 停顿
+	// 就可能下溢。把 GC 挪到这个"设备已关、下一首还没开"的安全间隙,播放期间就少停顿。
+	runtime.GC()
+
 	// 复用当前解码器:同一首歌的 Seek 表只建一次,后续拖动/跳转都瞬时。
 	opened := false
 	if e.decPath != m.path || e.dec == nil {
@@ -197,11 +245,17 @@ func (e *engine) runTrack(m ctrlMsg) {
 	}
 	defer a.Close()
 
+	// 记录本次输出模式(独占/共享)与是否位直出,供 UI 显示。
+	ps.setQuality(a, f, e.dev)
+
 	chunk := f.SampleRate / 100 // ~10ms 一个检查段
 	if chunk < 128 {
 		chunk = 128
 	}
 	devicePaused := false
+	// 复用一个每段 PCM 缓冲:播放期间几乎不再分配 → 垃圾极少 → 不必频繁 GC
+	// (独占缓冲小,GC 停顿会下溢;配合 init 里关自动 GC 更稳)。
+	writeBuf := make([]byte, 0, chunk*openCh*4)
 
 	// 定位起点:有 seek 则跳到目标采样;新开或重头则归零。
 	// 复用解码器 → Seek 表建一次,之后每次拖动都瞬时、不再回退。
@@ -241,6 +295,7 @@ func (e *engine) runTrack(m ctrlMsg) {
 			// 暂停:先尝试 ALSA 硬件暂停(无间隙);设备不支持则停止喂,
 			// 缓冲放完自动静音,恢复时靠 xrun-recover 兜底。
 			if atomic.LoadInt32(&ps.paused) == 1 && !devicePaused {
+				runtime.GC() // 暂停时设备静音,正好把 GC 挪到这:播放期间就少停顿(独占缓冲小,怕 GC 卡顿)
 				_ = a.Pause(true)
 				devicePaused = true
 			}
@@ -267,7 +322,7 @@ func (e *engine) runTrack(m ctrlMsg) {
 			// 文件声道不足 openCh 时重复末声道(单声道→立体声即复制);
 			// 文件声道多于 openCh 时取前几个(5.1→立体声取 L/R)。
 			fn := len(fr.Subframes)
-			buf := make([]byte, 0, (end-start)*openCh*4)
+			buf := writeBuf[:0] // 复用(Write 会拷贝,返回后即可重用)
 			vol := ps.Vol()
 			for i := start; i < end; i++ {
 				for c := 0; c < openCh; c++ {

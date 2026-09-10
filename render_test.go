@@ -44,3 +44,32 @@ func countBlocks(s string) int {
 	}
 	return n
 }
+
+func TestQualText(t *testing.T) {
+	cases := []struct {
+		name             string
+		rate, bits       int64
+		excl, bitExact   int32
+		devRate, devBits int64
+		want             string
+	}{
+		{"独占 48k/24", 48000, 24, 1, 1, 48000, 24, "独占 直出 48k/24bit"},
+		{"共享匹配 48k/24", 48000, 24, 0, 1, 48000, 32, "共享 直出 48k/24bit"},
+		{"共享重采样 96k/24→48k/32", 96000, 24, 0, 0, 48000, 32, "共享 重采样 96k/24bit→48k/32bit"},
+		{"共享不匹配 44.1k/16→48k/32", 44100, 16, 0, 0, 48000, 32, "共享 重采样 44.1k/16bit→48k/32bit"},
+	}
+	for _, c := range cases {
+		a := &app{ps: &playState{}}
+		atomic.StoreInt64(&a.ps.rate, c.rate)
+		atomic.StoreInt32(&a.ps.bits, int32(c.bits))
+		atomic.StoreInt32(&a.ps.exclusive, c.excl)
+		atomic.StoreInt32(&a.ps.bitExact, c.bitExact)
+		atomic.StoreInt64(&a.ps.devRate, c.devRate)
+		atomic.StoreInt32(&a.ps.devBits, int32(c.devBits))
+		got := a.qualText()
+		t.Logf("%-28s -> %q", c.name, got)
+		if got != c.want {
+			t.Errorf("qualText() = %q, want %q", got, c.want)
+		}
+	}
+}

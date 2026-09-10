@@ -10,6 +10,7 @@ package player
 
 import (
 	"fmt"
+	"os"
 	"strings"
 	"sync"
 	"syscall"
@@ -18,6 +19,8 @@ import (
 
 	"golang.org/x/sys/windows"
 )
+
+var debugWASAPI = os.Getenv("FPLAY_WAPI_DEBUG")
 
 // ---------- 常量 ----------
 
@@ -35,6 +38,9 @@ const (
 	vtLPWSTR                        = 0x1F   // PROPVARIANT 里的 VT_LPWSTR
 	coinitMTA                       = 0x0    // COINIT_MULTITHREADED
 	defaultPeriodHns          int64 = 100000 // 10ms(100ns 单位),设备无周期时兜底
+
+	// AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED:独占缓冲与设备周期未对齐(需按实际缓冲帧数重算)。
+	audclntBufferSizeNotAligned = 0x88890019
 )
 
 // ---------- 需要的 GUID ----------
@@ -111,6 +117,8 @@ var (
 	pcCreateEventW        = windows.NewLazySystemDLL("kernel32.dll").NewProc("CreateEventW")
 	pcWaitForSingleObject = windows.NewLazySystemDLL("kernel32.dll").NewProc("WaitForSingleObject")
 	pcCloseHandle         = windows.NewLazySystemDLL("kernel32.dll").NewProc("CloseHandle")
+	// MMCSS:把线程加入 "Pro Audio" 类别(降低音频爆音)。
+	pcAvSetMmThreadCharacteristicsW = windows.NewLazySystemDLL("avrt.dll").NewProc("AvSetMmThreadCharacteristicsW")
 )
 
 func coCreateInstance(clsid, iid *windows.GUID, out *unsafe.Pointer) error {
@@ -179,36 +187,66 @@ type waveFormatExtensible struct {
 	subFormat        windows.GUID
 }
 
-// buildFormat 依据源位深构造 WAVEFORMATEXTENSIBLE,并返回容器字节数/内容左移位数。
-// 24bit 一律用 32bit 容器(Sample<<8,左对齐),与 ALSA S32 容器策略一致,避开少数
-// 硬件对 3 字节 S24 支持不完整造成的错位白噪。
-func buildFormat(rate, channels, bps int) (*waveFormatExtensible, int, uint, error) {
-	var containerBits, validBits, bytesPer int
+// formatCandidate 一种可尝试的样本容器(决定 AppendSample 的 bytesPer/shift)。
+type formatCandidate struct {
+	wfx      *waveFormatExtensible
+	bytesPer int
+	shift    uint
+}
+
+// newCandidate 按「容器位 / 有效位 / 容器字节」构造一个候选。
+func newCandidate(rate, channels, containerBits, validBits, bytesPer int) formatCandidate {
+	blockAlign := channels * bytesPer
+	return formatCandidate{
+		wfx: &waveFormatExtensible{
+			wFormatTag:       wfmtTagExtensible,
+			nChannels:        uint16(channels),
+			nSamplesPerSec:   uint32(rate),
+			nAvgBytesPerSec:  uint32(rate * blockAlign),
+			nBlockAlign:      uint16(blockAlign),
+			wBitsPerSample:   uint16(containerBits),
+			cbSize:           22,
+			samplesValidBits: uint16(validBits),
+			dwChannelMask:    chanMask(channels),
+			subFormat:        pcmSubFormat,
+		},
+		bytesPer: bytesPer,
+		shift:    uint(containerBits - validBits),
+	}
+}
+
+// buildCandidates 按源位深给出可尝试的容器候选,按优先级排列。
+// 独占模式会用 IsFormatSupported 挑设备原生支持的那个(见 selectExclusiveFormat),
+// 以便「任何位深/采样率都尽量原参数直出」;共享模式取第一个交给系统换算。
+// 24bit:优先 32bit 容器(Sample<<8 左对齐,兼容性最好),再试真正的 24bit 容器(S24_3)。
+func buildCandidates(rate, channels, bps int) ([]formatCandidate, error) {
 	switch bps {
 	case 8:
-		containerBits, validBits, bytesPer = 8, 8, 1
+		return []formatCandidate{newCandidate(rate, channels, 8, 8, 1)}, nil
 	case 16:
-		containerBits, validBits, bytesPer = 16, 16, 2
+		return []formatCandidate{newCandidate(rate, channels, 16, 16, 2)}, nil
 	case 24:
-		containerBits, validBits, bytesPer = 32, 24, 4
+		return []formatCandidate{
+			newCandidate(rate, channels, 32, 24, 4),
+			newCandidate(rate, channels, 24, 24, 3),
+		}, nil
 	case 32:
-		containerBits, validBits, bytesPer = 32, 32, 4
+		return []formatCandidate{newCandidate(rate, channels, 32, 32, 4)}, nil
 	default:
-		return nil, 0, 0, fmt.Errorf("player: 不支持的位深 %d bit(仅 8/16/24/32)", bps)
+		return nil, fmt.Errorf("player: 不支持的位深 %d bit(仅 8/16/24/32)", bps)
 	}
-	blockAlign := channels * bytesPer
-	return &waveFormatExtensible{
-		wFormatTag:       wfmtTagExtensible,
-		nChannels:        uint16(channels),
-		nSamplesPerSec:   uint32(rate),
-		nAvgBytesPerSec:  uint32(rate * blockAlign),
-		nBlockAlign:      uint16(blockAlign),
-		wBitsPerSample:   uint16(containerBits),
-		cbSize:           22,
-		samplesValidBits: uint16(validBits),
-		dwChannelMask:    chanMask(channels),
-		subFormat:        pcmSubFormat,
-	}, bytesPer, uint(containerBits - validBits), nil
+}
+
+// selectExclusiveFormat 用 IsFormatSupported(EXCLUSIVE) 在候选里挑设备原生支持的格式。
+// 该调用不消耗 client,可多次调用;全不支持返回 nil。
+func selectExclusiveFormat(client unsafe.Pointer, cands []formatCandidate) *formatCandidate {
+	for i := range cands {
+		hr := comCall(client, 7, uintptr(shareModeExclusive), ap(cands[i].wfx), 0) // IsFormatSupported
+		if hrOK(hr) {
+			return &cands[i]
+		}
+	}
+	return nil
 }
 
 // chanMask 给出常见声道数的声道遮罩;拿不准时给 2(FL|FR)。
@@ -355,14 +393,14 @@ func OpenALSA(name string, sampleRate, channels, bps int) (*ALSA, error) {
 	if err != nil {
 		return nil, err
 	}
-	wfx, bytesPer, shift, err := buildFormat(sampleRate, channels, bps)
+	cands, err := buildCandidates(sampleRate, channels, bps)
 	if err != nil {
 		comRelease(dev)
 		return nil, err
 	}
 	var lastErr error
 	for _, exclusive := range []bool{true, false} {
-		a, err := openMode(dev, wfx, bytesPer, shift, channels, exclusive)
+		a, err := openMode(dev, cands, channels, exclusive)
 		if err == nil {
 			return a, nil // ALSA 接管 dev 所有权(Close 时释放)
 		}
@@ -372,9 +410,9 @@ func OpenALSA(name string, sampleRate, channels, bps int) (*ALSA, error) {
 	return nil, fmt.Errorf("player: 打不开输出设备(独占/共享都失败): %v", lastErr)
 }
 
-// openMode 以指定模式打开一个 IAudioClient。独占模式下会做"能否持续"探测;
-// 失败释放本模式的 client/event/render 并返回错误,不释放 dev(所有权在外层)。
-func openMode(dev unsafe.Pointer, wfx *waveFormatExtensible, bytesPer int, shift uint, channels int, exclusive bool) (*ALSA, error) {
+// openMode 以指定模式打开一个 IAudioClient。独占模式先挑设备原生支持的候选格式,并做
+// "能否持续"探测;失败释放本模式的 client/event/render 并返回错误,不释放 dev(所有权在外层)。
+func openMode(dev unsafe.Pointer, cands []formatCandidate, channels int, exclusive bool) (*ALSA, error) {
 	var client unsafe.Pointer
 	fail := func(err error) (*ALSA, error) {
 		if client != nil {
@@ -386,7 +424,17 @@ func openMode(dev unsafe.Pointer, wfx *waveFormatExtensible, bytesPer int, shift
 		return fail(fmt.Errorf("player: Activate IAudioClient 失败"))
 	}
 
-	ok, _, hr := initStream(client, wfx, exclusive)
+	// 选格式:独占挑设备原生支持的候选(以原采样率/位深直出);共享用第一个交给系统换算。
+	cand := cands[0]
+	if exclusive {
+		picked := selectExclusiveFormat(client, cands)
+		if picked == nil {
+			return fail(fmt.Errorf("player: 设备无原生支持的独占格式"))
+		}
+		cand = *picked
+	}
+
+	ok, _, hr := initStream(client, cand.wfx, exclusive)
 	if !ok {
 		return fail(fmt.Errorf("player: WASAPI 初始化失败(hr=0x%08x)", hr))
 	}
@@ -415,9 +463,9 @@ func openMode(dev unsafe.Pointer, wfx *waveFormatExtensible, bytesPer int, shift
 		dev:       dev,
 		evt:       ev,
 		bufSize:   bufSize,
-		bytesPer:  bytesPer,
-		shift:     shift,
-		frame:     bytesPer * channels,
+		bytesPer:  cand.bytesPer,
+		shift:     cand.shift,
+		frame:     cand.bytesPer * channels,
 		exclusive: exclusive,
 		started:   false,
 	}
@@ -431,83 +479,72 @@ func openMode(dev unsafe.Pointer, wfx *waveFormatExtensible, bytesPer int, shift
 		comRelease(client)
 		return nil, fmt.Errorf("player: 独占模式在该设备不可靠(探测停滞/超时)")
 	}
-	// 独占可用:把探测写的静音停掉,让引擎首段重新进(避免残留)。
+	// 独占可用:停流 + Reset 清掉探测写的静音,让引擎首段从头进。
 	comCall(client, 11) // Stop
+	comCall(client, 12) // Reset(清缓冲)
 	a.started = false
+	a.fifo = a.fifo[:0]
+	setProAudioThread() // MMCSS "Pro Audio" 提线程优先级,降低独占爆音(照 mpv)
 	return a, nil
+}
+
+// setProAudioThread 把当前线程注册到 MMCSS "Pro Audio" 类别,降低音频爆音概率。
+// best-effort:失败静默(不影响功能);不 Revert,线程结束时系统自动回收。
+func setProAudioThread() {
+	name, err := windows.UTF16PtrFromString("Pro Audio")
+	if err != nil {
+		return
+	}
+	var idx uint32
+	pcAvSetMmThreadCharacteristicsW.Call(uintptr(unsafe.Pointer(name)), uintptr(unsafe.Pointer(&idx)))
 }
 
 // probeExclusive 往刚初始化的独占流写入约 5 个缓冲周期的静音,限定时间内能持续推进则判定
 // 独占可维持。返回 false 表示该设备独占不可靠(下溢停钟),调用方应回退共享。
+// probeExclusive 用整缓冲模型填 3 个缓冲并 Start,验证设备能否按事件持续消化(独占可持续)。
+// 事件超时 / GetBuffer 失败即返回 false,调用方同设备回退共享。
 func (a *WASAPI) probeExclusive(timeout time.Duration) bool {
-	target := int(a.bufSize) * 5
-	if target <= 0 {
+	if a.bufSize == 0 {
 		return false
 	}
-	buf := make([]byte, target*a.frame)
+	bufBytes := int(a.bufSize) * a.frame
 	deadline := time.Now().Add(timeout)
-	off := 0
-	stall := 0
-	for off < len(buf) {
-		if time.Now().After(deadline) {
+	// 填满「两个」缓冲(静音)再 Start,避免探测本身播到未初始化缓冲出噪音。
+	for i := 0; i < 2; i++ {
+		if time.Now().After(deadline) || !a.fillSilence(bufBytes) {
 			return false
 		}
-		avail := int(a.bufSize)
-		if a.started {
-			var pad uint32
-			if !hrOK(comCall(a.client, 6, ap(&pad))) {
-				return false
-			}
-			avail = int(a.bufSize) - int(pad)
-		}
-		if avail <= 0 {
-			if a.exclusive {
-				comCall(a.client, 10) // 防御性 Start
-			}
-			a.waitEvent()
-			stall++
-			if stall > 5 { // 紧阈值:约 0.5s 无进展判定不可用
-				return false
-			}
-			continue
-		}
-		stall = 0
-		frames := avail
-		if remain := (len(buf) - off) / a.frame; frames > remain {
-			frames = remain
-		}
-		if frames <= 0 {
-			break
-		}
-		var data unsafe.Pointer
-		if !hrOK(comCall(a.render, 3, uintptr(frames), ap(&data))) || data == nil {
-			return false
-		}
-		nb := frames * a.frame
-		clear(unsafe.Slice((*byte)(data), nb)) // 静音
-		comCall(a.render, 4, uintptr(frames), 0)
-		if !a.started {
-			comCall(a.client, 10) // Start
-			a.started = true
-		}
-		off += nb
 	}
-	return off >= len(buf)
+	comCall(a.client, 10) // Start
+	a.started = true
+	// 再等一次事件并补一块,验证设备能持续按期消化。
+	if time.Now().After(deadline) || !a.waitEvent() {
+		return false
+	}
+	return a.fillSilence(bufBytes)
 }
 
 // initStream 尝试以事件驱动方式初始化音频流。独占失败返回 false,交由调用方回退共享。
 func initStream(client unsafe.Pointer, wfx *waveFormatExtensible, exclusive bool) (bool, bool, uintptr) {
 	if exclusive {
-		// 独占事件驱动:缓冲 = 周期(设备允许的标准独占配置)。hnsPeriodicity 应与缓冲一致。
+		// 独占事件驱动:Microsoft 规定 hnsPeriodicity 必须非 0 且等于 hnsBufferDuration。
+		// 先取设备默认周期;若返回"缓冲大小未对齐"(AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED),
+		// 退到最小周期重试一次(参考 mpv 的 align hack)。
 		var defPer, minPer int64
 		comCall(client, 9, ap(&defPer), ap(&minPer)) // GetDevicePeriod
 		if defPer <= 0 {
 			defPer = defaultPeriodHns
 		}
-		hr := comCall(client, 3,
-			uintptr(shareModeExclusive), uintptr(streamFlagsEventCallback),
-			uintptr(defPer), uintptr(defPer),
-			ap(wfx), 0)
+		tryInit := func(dur int64) uintptr {
+			return comCall(client, 3,
+				uintptr(shareModeExclusive), uintptr(streamFlagsEventCallback),
+				uintptr(dur), uintptr(dur),
+				ap(wfx), 0)
+		}
+		hr := tryInit(defPer)
+		if hr == audclntBufferSizeNotAligned && minPer > 0 && minPer != defPer {
+			hr = tryInit(minPer)
+		}
 		return hrOK(hr), hrOK(hr), hr
 	}
 	// 共享:AUTOCONVERTPCM 让系统把 file 原生格式换算到端点混音格式;缓冲/周期交给系统(0)。
@@ -533,7 +570,8 @@ type WASAPI struct {
 	shift     uint           // 内容左移位数
 	frame     int            // 每帧字节 = channels*bytesPer
 	exclusive bool
-	started   bool // 是否已 Start(首次提交缓冲后置 true)
+	started   bool   // 是否已 Start(首次提交缓冲后置 true)
+	fifo      []byte // 独占模式:攒够一个整缓冲再整块提交(见 writeExclusive)
 }
 
 // ALSA 在 Windows 上就是 WASAPI(类型别名,让 engine 的 *player.ALSA 零改动)。
@@ -544,9 +582,10 @@ func (a *WASAPI) AppendSample(buf []byte, v int32) []byte {
 	return appendPCM(buf, v, a.bytesPer, a.shift)
 }
 
-// waitEvent 等通知或超时(100ms 兜底,防事件丢失卡死)。
-func (a *WASAPI) waitEvent() {
-	pcWaitForSingleObject.Call(a.evt, 100)
+// waitEvent 等设备事件通知;返回 true=被信号唤醒,false=超时(100ms,防事件丢失卡死)。
+func (a *WASAPI) waitEvent() bool {
+	r, _, _ := pcWaitForSingleObject.Call(a.evt, 100)
+	return r == 0 // WAIT_OBJECT_0
 }
 
 // Write 阻塞写入交错 PCM,直到全部进入设备缓冲(实现 io.Writer 的节流)。
@@ -567,12 +606,19 @@ func (a *WASAPI) Write(p []byte) (n int, err error) {
 	if len(p)%a.frame != 0 {
 		return 0, fmt.Errorf("player: WASAPI 输入不是整帧(每帧 %d 字节): %d", a.frame, len(p))
 	}
+	if a.exclusive {
+		return a.writeExclusive(p)
+	}
+	return a.writeShared(p)
+}
+
+// writeShared 共享模式:轮询 GetCurrentPadding,按可用空间部分填(共享只有单一缓冲)。
+func (a *WASAPI) writeShared(p []byte) (int, error) {
 	off := 0
-	lastProgress := time.Now() // 统一停滞看门狗:超过 4s 无进展即报错
+	lastProgress := time.Now()
 	for off < len(p) {
 		avail := int(a.bufSize)
 		if a.started {
-			// 已启动:可用空间 = 缓冲 - 填充。pad==bufSize 表示下溢(时钟停了)。
 			var pad uint32
 			hr := comCall(a.client, 6, ap(&pad)) // GetCurrentPadding
 			if !hrOK(hr) {
@@ -581,13 +627,7 @@ func (a *WASAPI) Write(p []byte) (n int, err error) {
 			avail = int(a.bufSize) - int(pad)
 		}
 		if avail <= 0 {
-			// 独占下溢(停钟)用事件唤醒;共享用短暂轮询,都交给统一看门狗兜底。
-			if a.exclusive {
-				comCall(a.client, 10) // Start
-				a.waitEvent()
-			} else {
-				time.Sleep(2 * time.Millisecond)
-			}
+			time.Sleep(2 * time.Millisecond)
 			if time.Since(lastProgress) > 4*time.Second {
 				return off, fmt.Errorf("player: WASAPI 输出设备停滞(4s 无可用缓冲)")
 			}
@@ -603,24 +643,16 @@ func (a *WASAPI) Write(p []byte) (n int, err error) {
 		var data unsafe.Pointer
 		hr := comCall(a.render, 3, uintptr(frames), ap(&data)) // GetBuffer
 		if !hrOK(hr) || data == nil {
-			// 失败或 S_OK+空指针——多为瞬态(AUDCLNT_E_BUFFER_OPERATION_PENDING / S_BUFFER_EMPTY,
-			// 上次 ReleaseBuffer 的锁还没释放)或重新排队中。短暂等待后重试,别当终止。
-			if a.exclusive {
-				a.waitEvent()
-			} else if data == nil {
-				time.Sleep(2 * time.Millisecond)
-			} else {
-				time.Sleep(5 * time.Millisecond)
-			}
+			// 瞬态(S_OK+空指针 / BUFFER_OPERATION_PENDING):短暂等待后重试,别当终止。
+			time.Sleep(2 * time.Millisecond)
 			if time.Since(lastProgress) > 5*time.Second {
-				return off, fmt.Errorf("player: WASAPI GetBuffer 持续失败(hr=0x%08x data=%v)", hr, data != nil)
+				return off, fmt.Errorf("player: WASAPI GetBuffer 持续失败(hr=0x%08x)", hr)
 			}
 			continue
 		}
 		nbytes := frames * a.frame
 		copy(unsafe.Slice((*byte)(data), nbytes), p[off:off+nbytes])
 		comCall(a.render, 4, uintptr(frames), 0) // ReleaseBuffer(flags=0)
-		// 首次提交数据后再 Start,避免独占模式空缓冲下溢停钟。
 		if !a.started {
 			comCall(a.client, 10) // Start
 			a.started = true
@@ -629,6 +661,109 @@ func (a *WASAPI) Write(p []byte) (n int, err error) {
 		lastProgress = time.Now()
 	}
 	return len(p), nil
+}
+
+// writeExclusive 独占事件驱动喂法(照 mpv ao_wasapi):WASAPI 为独占流分配「两个」各
+// bufSize 帧的缓冲,事件 ping-pong 交换。必须每次 GetBuffer(bufSize) 请求并填「整个缓冲」,
+// 且只在设备信号事件后才填下一块(独占的 GetCurrentPadding 跨两个缓冲计,用它算空间会得 0)。
+// 关键:Start 前必须把「两个」缓冲都填上——否则设备播到第二个未填缓冲会读出未初始化内存,
+// 表现为切歌/快进/起播瞬间的"滋滋"噪音。
+func (a *WASAPI) writeExclusive(p []byte) (int, error) {
+	if a.bufSize == 0 {
+		return 0, fmt.Errorf("player: WASAPI 缓冲区大小为 0")
+	}
+	a.fifo = append(a.fifo, p...)
+	bufBytes := int(a.bufSize) * a.frame
+	lastProgress := time.Now()
+
+	// 首块:攒够一个整缓冲后,先把两个 ping-pong 缓冲都填上再 Start。
+	if !a.started {
+		if len(a.fifo) < bufBytes {
+			return len(p), nil // 还不够一个整块,等后续 Write 补
+		}
+		if !a.fillOne(bufBytes) {
+			return 0, fmt.Errorf("player: WASAPI 独占首块填充失败")
+		}
+		// 第二个缓冲:有整块数据就填数据,没有就填整块静音(不混半块、不留未初始化)。
+		if len(a.fifo) >= bufBytes {
+			if !a.fillOne(bufBytes) {
+				return 0, fmt.Errorf("player: WASAPI 独占次块填充失败")
+			}
+		} else if !a.fillSilence(bufBytes) {
+			return 0, fmt.Errorf("player: WASAPI 独占静音填充失败")
+		}
+		comCall(a.client, 10) // Start
+		a.started = true
+	}
+
+	// 之后:纯事件驱动——等设备消化掉一块,然后尽快补齐(每事件最多填两块,照 mpv
+	// `thread_feed() && thread_feed()`)。绝不用 GetCurrentPadding 决定是否可填:独占下它
+	// 不可靠,会导致 GetBuffer 拿到仍在播放的缓冲并覆盖它 → 怪声/错位。GetBuffer 只会返回
+	// 空闲缓冲,两块都满时它会失败——那是正常信号,直接停手等下一个事件。
+	for len(a.fifo) >= bufBytes {
+		if !a.waitEvent() {
+			if debugWASAPI != "" {
+				fmt.Fprintf(os.Stderr, "[wapi] 事件超时 fifo=%d\n", len(a.fifo))
+			}
+			comCall(a.client, 10) // 下溢停钟:唤醒重试
+			if time.Since(lastProgress) > 5*time.Second {
+				return 0, fmt.Errorf("player: WASAPI 独占事件超时(设备停滞)")
+			}
+			continue
+		}
+		if !a.fillOne(bufBytes) {
+			// 事件到了却没填空闲缓冲 → 独占流已失序/停钟(GetBuffer 返回 OUT_OF_ORDER)。
+			// 光 Start 不顶用,做一次 Stop+Reset 复位,重填两块再 Start,让播放续上。
+			if debugWASAPI != "" {
+				fmt.Fprintf(os.Stderr, "[wapi] 流失序,复位重来 fifo=%d\n", len(a.fifo))
+			}
+			comCall(a.client, 11) // Stop
+			comCall(a.client, 12) // Reset
+			for i := 0; i < 2; i++ {
+				if len(a.fifo) >= bufBytes {
+					a.fillOne(bufBytes)
+				} else {
+					a.fillSilence(bufBytes)
+				}
+			}
+			comCall(a.client, 10) // Start
+			a.started = true
+			if time.Since(lastProgress) > 5*time.Second {
+				return 0, fmt.Errorf("player: WASAPI 独占复位后仍失败(设备停滞)")
+			}
+			lastProgress = time.Now()
+			continue
+		}
+		lastProgress = time.Now()
+	}
+	return len(p), nil
+}
+
+// fillOne 取一个整缓冲,从 fifo 拷满 bufBytes 字节后 ReleaseBuffer。fifo 不足整块时返回
+// false(不取缓冲、不释放,避免泄漏)。调用方保证 fifo 够。
+func (a *WASAPI) fillOne(bufBytes int) bool {
+	if len(a.fifo) < bufBytes {
+		return false
+	}
+	var data unsafe.Pointer
+	if !hrOK(comCall(a.render, 3, uintptr(a.bufSize), ap(&data))) || data == nil {
+		return false
+	}
+	copy(unsafe.Slice((*byte)(data), bufBytes), a.fifo[:bufBytes])
+	a.fifo = a.fifo[bufBytes:]
+	comCall(a.render, 4, uintptr(a.bufSize), 0) // ReleaseBuffer(整个缓冲)
+	return true
+}
+
+// fillSilence 取一个整缓冲填静音后 ReleaseBuffer(起播时第二个缓冲没数据可用)。
+func (a *WASAPI) fillSilence(bufBytes int) bool {
+	var data unsafe.Pointer
+	if !hrOK(comCall(a.render, 3, uintptr(a.bufSize), ap(&data))) || data == nil {
+		return false
+	}
+	clear(unsafe.Slice((*byte)(data), bufBytes))
+	comCall(a.render, 4, uintptr(a.bufSize), 0) // ReleaseBuffer
+	return true
 }
 
 // Pause 暂停/继续。引擎暂停时本就停止喂数据,这里用 Stop/Start 复位流,
@@ -642,10 +777,13 @@ func (a *WASAPI) Pause(on bool) error {
 	return nil
 }
 
-// Close 停止流并释放所有 COM 引用。
+// Close 停止流并释放所有 COM 引用。独占下先等缓冲放完,避免掐掉尾部。
 func (a *WASAPI) Close() error {
 	if a.client == nil {
 		return nil
+	}
+	if a.exclusive && a.started {
+		a.drainExclusive()
 	}
 	comCall(a.client, 11) // Stop
 	if a.evt != 0 {
@@ -655,13 +793,29 @@ func (a *WASAPI) Close() error {
 	comRelease(a.client)
 	comRelease(a.dev)
 	a.client, a.render, a.dev, a.evt = nil, nil, nil, 0
+	a.fifo = nil
 	return nil
+}
+
+// drainExclusive 独占:等设备把已提交的缓冲放完(pad 归零),最多约 300ms。
+func (a *WASAPI) drainExclusive() {
+	deadline := time.Now().Add(300 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		var pad uint32
+		if !hrOK(comCall(a.client, 6, ap(&pad))) || pad == 0 {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
 }
 
 // ProbeChannels Windows 探测声道范围;engine 未实际用到,留 API 完整。
 func ProbeChannels(name string) (int, int, error) {
 	return 1, 8, nil
 }
+
+// Exclusive 当前流是否独占(位完美直出)模式,供 UI 显示。
+func (a *WASAPI) Exclusive() bool { return a.exclusive }
 
 // DeviceMixFormat 返回指定端点(空/"default"→默认播放入口)的共享混音格式:采样率/容器位深/声道。
 // 用于 bit-perfect 检测:共享模式下 WASAPI 最终是混到该格式(重采样/升位都发生在这里),

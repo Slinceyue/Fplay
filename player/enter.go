@@ -12,6 +12,7 @@ func (*ALSA) Close() error                            { return nil }
 func (*ALSA) Pause(bool) error                        { return nil }
 func (*ALSA) Write(p []byte) (int, error)             { return len(p), io.EOF }
 func (*ALSA) AppendSample(buf []byte, v int32) []byte { return buf }
+func (*ALSA) Exclusive() bool                         { return false }
 
 // FindECHOADevice 其它平台是 no-op。
 func FindECHOADevice() string { return "" }
@@ -23,6 +24,9 @@ func AlsaDevices() []AlsaDevice { return nil }
 func OpenALSA(name string, sampleRate, channels, bps int) (*ALSA, error) {
 	return nil, errorString("ALSA 后端仅支持 Linux;其它平台后端待实现")
 }
+
+// DeviceMixFormat 其它平台无此概念,返回 ok=false。
+func DeviceMixFormat(name string) (rate, bits, ch int, ok bool) { return 0, 0, 0, false }
 
 type errorString string
 
