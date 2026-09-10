@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime/debug"
 	"sort"
 	"strconv"
 	"strings"
@@ -48,6 +49,15 @@ type app struct {
 	diag        bool
 
 	dirs []string // 持久化的音乐目录
+}
+
+// init 调整 GC:音频输出缓冲很小,播放中一次 GC 停顿就可能喂不上数据而下溢(实测
+// GOGC=off 能完全消除)。所以关掉自动 GC,改为在切歌/暂停的安全间隙主动 GC
+// (见 engine.runTrack);另设内存软上限做安全阀——万一超长曲目把垃圾攒到上限,
+// 运行时仍会兜底 GC,不至于吃爆内存。
+func init() {
+	debug.SetMemoryLimit(512 << 20)
+	debug.SetGCPercent(-1)
 }
 
 func main() {

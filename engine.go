@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"io"
+	"runtime"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -141,6 +142,10 @@ func (e *engine) runTrack(m ctrlMsg) {
 	atomic.StoreInt32(&ps.playing, 1)
 	atomic.StoreInt64(&ps.total, 0)
 
+	// 切歌/重开设备的间隙里主动做一次 GC:输出缓冲很小,播放中一次 GC 停顿就可能下溢。
+	// 把 GC 挪到这个"设备已关、下一首还没开"的安全间隙,播放期间就少停顿。
+	runtime.GC()
+
 	// 复用当前解码器:同一首歌的 Seek 表只建一次,后续拖动/跳转都瞬时。
 	opened := false
 	if e.decPath != m.path || e.dec == nil {
@@ -202,6 +207,9 @@ func (e *engine) runTrack(m ctrlMsg) {
 		chunk = 128
 	}
 	devicePaused := false
+	// 复用一个每段 PCM 缓冲:播放期间几乎不再分配 → 垃圾极少 → 不必频繁 GC
+	// (输出缓冲小,GC 停顿会下溢;配合 init 里关自动 GC 更稳)。
+	writeBuf := make([]byte, 0, chunk*openCh*4)
 
 	// 定位起点:有 seek 则跳到目标采样;新开或重头则归零。
 	// 复用解码器 → Seek 表建一次,之后每次拖动都瞬时、不再回退。
@@ -241,6 +249,7 @@ func (e *engine) runTrack(m ctrlMsg) {
 			// 暂停:先尝试 ALSA 硬件暂停(无间隙);设备不支持则停止喂,
 			// 缓冲放完自动静音,恢复时靠 xrun-recover 兜底。
 			if atomic.LoadInt32(&ps.paused) == 1 && !devicePaused {
+				runtime.GC() // 暂停时设备静音,正好把 GC 挪到这:播放期间就少停顿(缓冲小,怕 GC 卡顿)
 				_ = a.Pause(true)
 				devicePaused = true
 			}
@@ -267,7 +276,7 @@ func (e *engine) runTrack(m ctrlMsg) {
 			// 文件声道不足 openCh 时重复末声道(单声道→立体声即复制);
 			// 文件声道多于 openCh 时取前几个(5.1→立体声取 L/R)。
 			fn := len(fr.Subframes)
-			buf := make([]byte, 0, (end-start)*openCh*4)
+			buf := writeBuf[:0] // 复用(Write 会拷贝,返回后即可重用)
 			vol := ps.Vol()
 			for i := start; i < end; i++ {
 				for c := 0; c < openCh; c++ {
